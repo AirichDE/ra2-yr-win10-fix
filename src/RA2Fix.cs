@@ -517,9 +517,20 @@ namespace RA2Fix
             while (true)
             {
                 int p = IndexOf(d, pat, from);
-                if (p < 0) return -1;
+                if (p < 0) break;
                 from = p + 1;
                 if (!pe.IsCode(p)) continue;
+                // already patched by this tool? ("mov al,1 ; ret" replaced the first 3 bytes of the function,
+                // the rest of the prologue and the push of the marker string are still there)
+                bool wasPatched = false;
+                for (int q = p - 3; q >= p - 14 && q > 0; q--)
+                {
+                    if (d[q] == 0xB0 && d[q + 1] == 0x01 && d[q + 2] == 0xC3 &&
+                        (d[q - 1] == 0x90 || d[q - 1] == 0xCC || d[q - 1] == 0xC3 || d[q - 1] == 0xC2) &&
+                        PrologueOnly(d, q + 3, p))
+                    { wasPatched = true; return q; }
+                }
+                if (wasPatched) continue;
                 // walk back over a plain prologue: push r32 / sub esp,imm8
                 int s = p;
                 int guard = 0;
@@ -530,10 +541,47 @@ namespace RA2Fix
                     if (s >= 3 && d[s - 3] == 0x83 && d[s - 2] == 0xEC) { s -= 3; continue; }
                     break;
                 }
-                // the function must start right after padding / the previous function's ret
+                // the function must start right after padding / the previous function's ret,
+                // and must begin like a normal function (push r32 / sub esp / push imm)
                 byte before = d[s - 1];
-                if (before == 0x90 || before == 0xCC || before == 0xC3 || before == 0xC2) return s;
+                bool padOk = before == 0x90 || before == 0xCC || before == 0xC3 || before == 0xC2;
+                bool opOk = d[s] == 0x51 || d[s] == 0x53 || d[s] == 0x55 || d[s] == 0x56 || d[s] == 0x57 || d[s] == 0x83 || d[s] == 0x68;
+                if (padOk && opOk) return s;
             }
+
+            // Not found: the function may already be patched in a way that also destroyed the "push imm32"
+            // (when the prologue before the push is 0-2 bytes long, "B0 01 C3" overwrites the push opcode
+            // and/or the first immediate bytes). Look for  B0 01 C3 + the remaining immediate bytes.
+            for (int k = 0; k <= 2; k++)
+            {
+                int tailStart = 3 - k - 1; // first immediate byte that survives (k=2 -> 0, k=1 -> 1, k=0 -> 2)
+                if (k == 2) tailStart = 0;
+                List<byte> rem = new List<byte>();
+                rem.Add(0xB0); rem.Add(0x01); rem.Add(0xC3);
+                for (int i = tailStart; i < 4; i++) rem.Add(pat[1 + i]);
+                byte[] rp = rem.ToArray();
+                int at = 0;
+                while ((at = IndexOf(d, rp, at)) >= 0)
+                {
+                    int q = at; at++;
+                    if (q > 0 && pe.IsCode(q) && (d[q - 1] == 0x90 || d[q - 1] == 0xCC || d[q - 1] == 0xC3 || d[q - 1] == 0xC2)) return q;
+                }
+            }
+            return -1;
+        }
+
+        // bytes [from, to) consist only of push r32 / sub esp,imm8 (the rest of a function prologue)
+        static bool PrologueOnly(byte[] d, int from, int to)
+        {
+            int i = from;
+            while (i < to)
+            {
+                byte b = d[i];
+                if (b == 0x51 || b == 0x53 || b == 0x55 || b == 0x56 || b == 0x57) { i++; continue; }
+                if (b == 0x83 && i + 2 < to + 1 && d[i + 1] == 0xEC) { i += 3; continue; }
+                return false;
+            }
+            return i == to;
         }
 
         static int IndexOf(byte[] h, byte[] n, int start)
